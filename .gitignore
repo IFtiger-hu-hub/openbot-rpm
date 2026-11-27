@@ -1,0 +1,17 @@
+# Build artifacts and generated repository metadata
+build/
+dist/
+downloads/
+site/
+squashfs-root/
+
+# Upstream payloads and built packages
+*.AppImage
+*.rpm
+*.tar.*
+
+# OS / editor
+.DS_Store
+.directory
+*.swp
+*~

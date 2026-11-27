@@ -1,0 +1,422 @@
+name: Build OpenBot RPM
+
+# 合并到 main 之后不会自动开跑。首次构建请先在仓库 Settings → Pages
+# 把 Source 设为 GitHub Actions，再到 Actions → Build OpenBot RPM →
+# Run workflow，版本留空。定时任务只在默认分支上生效。
+#
+# 每天 02:00 UTC，即北京时间（Asia/Shanghai，无夏令时）10:00。
+# GitHub 的 schedule 可能再延迟几分钟到几十分钟。
+
+on:
+  schedule:
+    - cron: "0 2 * * *"
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "OpenBot 版本（例如 0.80.0）。留空则自动检测最新稳定版。"
+        required: false
+        type: string
+      appimage_url:
+        description: "官方 x86_64 AppImage 的 GitHub Releases 下载地址（可选，须来自 nightly-labs/openbot）。"
+        required: false
+        type: string
+      release:
+        description: "RPM release 号"
+        required: false
+        default: "1"
+        type: string
+      force:
+        description: "即使该版本的 GitHub Release 已存在也强制重建并覆盖软件源"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-openbot-rpm
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    name: Resolve Version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      appimage_url: ${{ steps.resolve.outputs.appimage_url }}
+      checksum_url: ${{ steps.resolve.outputs.checksum_url }}
+      release: ${{ steps.resolve.outputs.release }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      should_build: ${{ steps.check_release.outputs.should_build }}
+
+    steps:
+      - name: Determine target version and download URL
+        id: resolve
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_URL: ${{ inputs.appimage_url }}
+          INPUT_RELEASE: ${{ inputs.release }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          VERSION_RE='^[0-9]+\.[0-9]+\.[0-9]+$'
+          RPM_REL="${INPUT_RELEASE:-1}"
+          if [[ -z "$RPM_REL" ]]; then
+            RPM_REL=1
+          fi
+          if [[ ! "$RPM_REL" =~ ^[0-9]+$ ]]; then
+            echo "ERROR: RPM release must be an integer." >&2
+            exit 1
+          fi
+
+          official_asset_url() {
+            local ver="$1"
+            printf 'https://github.com/nightly-labs/openbot/releases/download/v%s/OpenBot-%s-x86_64.AppImage' "$ver" "$ver"
+          }
+
+          VERSION=""
+          APPIMAGE_URL=""
+
+          if [[ -n "${INPUT_URL}" ]]; then
+            if [[ ! "$INPUT_URL" =~ ^https://github.com/nightly-labs/openbot/releases/download/v([0-9]+\.[0-9]+\.[0-9]+)/OpenBot-([0-9]+\.[0-9]+\.[0-9]+)-x86_64\.AppImage$ ]]; then
+              echo "ERROR: appimage_url must be an official nightly-labs/openbot x86_64 AppImage URL." >&2
+              exit 1
+            fi
+            if [[ "${BASH_REMATCH[1]}" != "${BASH_REMATCH[2]}" ]]; then
+              echo "ERROR: tag version and filename version in appimage_url do not match." >&2
+              exit 1
+            fi
+            VERSION="${BASH_REMATCH[1]}"
+            APPIMAGE_URL="$INPUT_URL"
+            if [[ -n "${INPUT_VERSION}" && "${INPUT_VERSION}" != "$VERSION" ]]; then
+              echo "ERROR: version input (${INPUT_VERSION}) does not match appimage_url (${VERSION})." >&2
+              exit 1
+            fi
+          elif [[ -n "${INPUT_VERSION}" ]]; then
+            VERSION="${INPUT_VERSION}"
+            if [[ ! "$VERSION" =~ $VERSION_RE ]]; then
+              echo "ERROR: version must look like 0.80.0." >&2
+              exit 1
+            fi
+            APPIMAGE_URL="$(official_asset_url "$VERSION")"
+          elif [[ "$REF_TYPE" == "tag" && "$REF_NAME" == v* ]]; then
+            VERSION="${REF_NAME#v}"
+            if [[ ! "$VERSION" =~ $VERSION_RE ]]; then
+              echo "ERROR: tag ${REF_NAME} is not v<major>.<minor>.<patch>." >&2
+              exit 1
+            fi
+            APPIMAGE_URL="$(official_asset_url "$VERSION")"
+          else
+            RELEASES_JSON="$(
+              curl -fsSL \
+                -H "Authorization: Bearer ${GH_TOKEN}" \
+                -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                "https://api.github.com/repos/nightly-labs/openbot/releases?per_page=100"
+            )"
+            mapfile -t CANDIDATES < <(
+              printf '%s' "$RELEASES_JSON" | jq -r '
+                [
+                  .[]
+                  | select(.draft == false and .prerelease == false)
+                  | select(.tag_name | test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))
+                  | .tag_name[1:] as $ver
+                  | select(any(.assets[]; .name == ("OpenBot-" + $ver + "-x86_64.AppImage")))
+                  | $ver
+                ]
+                | .[]
+              '
+            )
+            if [[ ${#CANDIDATES[@]} -eq 0 ]]; then
+              echo "ERROR: No stable OpenBot release with an x86_64 AppImage was found." >&2
+              exit 1
+            fi
+            VERSION="$(printf '%s\n' "${CANDIDATES[@]}" | sort -V | tail -n 1)"
+            APPIMAGE_URL="$(official_asset_url "$VERSION")"
+            echo "Candidate versions: ${CANDIDATES[*]}"
+          fi
+
+          CHECKSUM_URL="https://github.com/nightly-labs/openbot/releases/download/v${VERSION}/SHA256SUMS-linux.txt"
+          echo "Validating ${APPIMAGE_URL}"
+          curl -fsIL --retry 3 --retry-delay 2 -o /dev/null "$APPIMAGE_URL"
+          curl -fsIL --retry 3 --retry-delay 2 -o /dev/null "$CHECKSUM_URL"
+
+          TAG="v${VERSION}"
+          echo "Resolved version=${VERSION} tag=${TAG} release=${RPM_REL}"
+
+          {
+            echo "version=${VERSION}"
+            echo "appimage_url=${APPIMAGE_URL}"
+            echo "checksum_url=${CHECKSUM_URL}"
+            echo "release=${RPM_REL}"
+            echo "tag=${TAG}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Check if Release already exists and prevent downgrade
+        id: check_release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_FORCE: ${{ inputs.force }}
+          TARGET_TAG: ${{ steps.resolve.outputs.tag }}
+          TARGET_VER: ${{ steps.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          FORCE="${INPUT_FORCE:-false}"
+          if [[ -z "$FORCE" ]]; then
+            FORCE=false
+          fi
+
+          if [[ "$FORCE" == "true" ]]; then
+            echo "Force rebuild enabled."
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if gh release view "$TARGET_TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "Release ${TARGET_TAG} already exists. Skipping build."
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          EXISTING_VERSIONS="$(
+            gh release list --repo "${{ github.repository }}" --limit 100 --json tagName -q '.[].tagName' 2>/dev/null \
+            | sed 's/^v//' \
+            | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' || true
+          )"
+
+          if [[ -n "$EXISTING_VERSIONS" ]]; then
+            LATEST_EXISTING_VER="$(printf '%s\n' "${EXISTING_VERSIONS}" | sort -V | tail -n 1)"
+            echo "Highest existing release version: ${LATEST_EXISTING_VER}"
+            echo "Target version to build: ${TARGET_VER}"
+            LOWEST="$(printf '%s\n%s\n' "$TARGET_VER" "$LATEST_EXISTING_VER" | sort -V | head -n 1)"
+            if [[ "$TARGET_VER" != "$LATEST_EXISTING_VER" && "$LOWEST" == "$TARGET_VER" ]]; then
+              echo "Target ${TARGET_VER} is older than existing ${LATEST_EXISTING_VER}. Skipping."
+              echo "should_build=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          echo "Release ${TARGET_TAG} does not exist. Proceeding."
+          echo "should_build=true" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build RPM & Zypper Repo
+    needs: resolve
+    if: needs.resolve.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download official OpenBot AppImage
+        shell: bash
+        env:
+          APPIMAGE_URL: ${{ needs.resolve.outputs.appimage_url }}
+          CHECKSUM_URL: ${{ needs.resolve.outputs.checksum_url }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p downloads
+          APPIMAGE="downloads/OpenBot-${VERSION}-x86_64.AppImage"
+          echo "Downloading ${APPIMAGE_URL}"
+          curl -fL --retry 3 --retry-delay 5 -o "$APPIMAGE" "$APPIMAGE_URL"
+          curl -fL --retry 3 --retry-delay 5 -o downloads/SHA256SUMS-linux.txt "$CHECKSUM_URL"
+          (cd downloads && sha256sum -c SHA256SUMS-linux.txt)
+          ls -lh "$APPIMAGE"
+
+      - name: Build RPM and generate rpm-md metadata inside openSUSE Tumbleweed
+        shell: bash
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+          RPM_RELEASE: ${{ needs.resolve.outputs.release }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist site
+          docker run --rm \
+            -v "${PWD}:/work" \
+            -w /work \
+            -e "VERSION=${VERSION}" \
+            -e "RPM_RELEASE=${RPM_RELEASE}" \
+            opensuse/tumbleweed \
+            bash -euo pipefail -c '
+              zypper --non-interactive refresh
+              zypper --non-interactive install --no-recommends \
+                rpm-build createrepo_c squashfs binutils tar gzip zstd \
+                gawk sed grep findutils coreutils
+              ./build.sh -r "${RPM_RELEASE}" "downloads/OpenBot-${VERSION}-x86_64.AppImage"
+              cp -f "dist/openbot-${VERSION}-${RPM_RELEASE}.x86_64.rpm" site/
+              createrepo_c --no-database site/
+              chmod -R a+rX dist site
+            '
+
+      - name: Generate SHA256SUMS, .repo file, and Pages index
+        id: verify
+        shell: bash
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+          RPM_RELEASE: ${{ needs.resolve.outputs.release }}
+          REPO_OWNER: ${{ github.repository_owner }}
+          REPO_NAME: ${{ github.event.repository.name }}
+        run: |
+          set -euo pipefail
+          RPM_BASENAME="openbot-${VERSION}-${RPM_RELEASE}.x86_64.rpm"
+          RPM_FILE="dist/${RPM_BASENAME}"
+          test -f "$RPM_FILE"
+          PAGES_URL="https://${REPO_OWNER}.github.io/${REPO_NAME}/"
+          PAGES_URL="$(printf '%s' "$PAGES_URL" | tr '[:upper:]' '[:lower:]')"
+
+          (cd dist && sha256sum "$RPM_BASENAME" > SHA256SUMS)
+          cp -f dist/SHA256SUMS site/SHA256SUMS
+
+          cat > site/openbot.repo <<EOF
+          [openbot-rpm]
+          name=OpenBot RPM Repository (openSUSE Tumbleweed)
+          enabled=1
+          autorefresh=1
+          baseurl=${PAGES_URL}
+          type=rpm-md
+          gpgcheck=0
+          EOF
+          sed -i 's/^          //' site/openbot.repo
+
+          cat > site/index.html <<EOF
+          <!doctype html>
+          <html lang="zh-CN">
+          <head>
+            <meta charset="utf-8">
+            <title>OpenBot RPM Repository (openSUSE Tumbleweed)</title>
+            <style>
+              body { font-family: system-ui, -apple-system, sans-serif; max-width: 760px; margin: 3rem auto; padding: 0 1.25rem; line-height: 1.6; color: #1f2328; }
+              pre { background: #f6f8fa; padding: 1rem; border-radius: 8px; overflow-x: auto; }
+              code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+            </style>
+          </head>
+          <body>
+            <h1>OpenBot RPM Repository</h1>
+            <p>非官方 openSUSE Tumbleweed 软件源。当前打包版本：<strong>${VERSION}</strong>（<code>${RPM_BASENAME}</code>）。</p>
+            <p>OpenBot 本体版权归 Synthetify Labs，许可为 PolyForm Noncommercial 1.0.0。本站只分发打包结果，与上游无隶属关系。</p>
+            <h2>在 openSUSE Tumbleweed 上添加软件源</h2>
+            <pre><code>sudo zypper ar ${PAGES_URL}openbot.repo
+          sudo zypper ref
+          sudo zypper install openbot</code></pre>
+            <p>之后用 <code>sudo zypper dup</code> 即可随软件源升级。</p>
+            <ul>
+              <li><a href="openbot.repo">openbot.repo</a></li>
+              <li><a href="repodata/repomd.xml">repodata/repomd.xml</a></li>
+              <li><a href="${RPM_BASENAME}">${RPM_BASENAME}</a></li>
+              <li><a href="SHA256SUMS">SHA256SUMS</a></li>
+              <li><a href="https://github.com/${{ github.repository }}">GitHub Repository</a></li>
+            </ul>
+          </body>
+          </html>
+          EOF
+          sed -i 's/^          //' site/index.html
+
+          cat dist/SHA256SUMS
+          ls -lh site/ site/repodata/
+          {
+            echo "rpm_file=${RPM_FILE}"
+            echo "rpm_name=${RPM_BASENAME}"
+            echo "pages_url=${PAGES_URL}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload GitHub Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: openbot-rpm-${{ needs.resolve.outputs.version }}
+          path: |
+            dist/*.rpm
+            dist/SHA256SUMS
+          retention-days: 14
+
+      - name: Create or Update GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          VER: ${{ needs.resolve.outputs.version }}
+          RPM_NAME: ${{ steps.verify.outputs.rpm_name }}
+          PAGES_URL: ${{ steps.verify.outputs.pages_url }}
+          APPIMAGE_URL: ${{ needs.resolve.outputs.appimage_url }}
+        run: |
+          set -euo pipefail
+          SHA256_LINE="$(cat dist/SHA256SUMS)"
+          NOTES_FILE="$(mktemp)"
+          sed 's/^          //' <<EOF > "$NOTES_FILE"
+          ## OpenBot ${VER} for openSUSE Tumbleweed (\`x86_64\`)
+
+          非官方打包。由官方 Linux AppImage 在 \`opensuse/tumbleweed\` 容器中解包后构建，安装后不需要 FUSE。
+          OpenBot 本体版权归 Synthetify Labs，许可为 PolyForm Noncommercial 1.0.0。商业使用需另行取得授权。
+
+          - 上游文件：${APPIMAGE_URL}
+
+          ### 方式一：Zypper 软件源（推荐，之后可 \`zypper dup\`）
+
+          \`\`\`bash
+          sudo zypper ar ${PAGES_URL}openbot.repo
+          sudo zypper ref
+          sudo zypper install openbot
+          \`\`\`
+
+          ### 方式二：直接安装 RPM
+
+          \`\`\`bash
+          sudo zypper --allow-unsigned-rpm install ${RPM_NAME}
+          \`\`\`
+
+          启动：应用菜单搜索 OpenBot，或在终端运行 \`openbot\`。
+
+          ### SHA256
+
+          \`\`\`text
+          ${SHA256_LINE}
+          \`\`\`
+          EOF
+
+          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release upload "$TAG" "dist/${RPM_NAME}" dist/SHA256SUMS --clobber --repo "${{ github.repository }}"
+            gh release edit "$TAG" --notes-file "$NOTES_FILE" --latest --repo "${{ github.repository }}"
+          else
+            gh release create "$TAG" "dist/${RPM_NAME}" dist/SHA256SUMS \
+              --title "OpenBot ${VER}" \
+              --notes-file "$NOTES_FILE" \
+              --latest \
+              --repo "${{ github.repository }}"
+          fi
+
+  deploy-pages:
+    name: Deploy Zypper Repository (GitHub Pages)
+    needs: [resolve, build]
+    if: needs.resolve.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

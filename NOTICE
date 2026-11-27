@@ -1,0 +1,36 @@
+OpenBot RPM 打包说明
+====================
+
+本仓库里的打包脚本、RPM spec 和 GitHub Actions 工作流采用 MIT License，
+见 LICENSE。
+
+这是非官方打包仓库，与 Synthetify Labs、nightly-labs 没有隶属、背书或
+合作关系。
+
+OpenBot 客户端本身的版权归 Synthetify Labs 所有，许可为
+PolyForm Noncommercial License 1.0.0：
+
+https://polyformproject.org/licenses/noncommercial/1.0.0/
+https://github.com/nightly-labs/openbot
+
+OpenBot 的商业使用需要另行取得 Synthetify Labs 的授权。本仓库构建出的
+RPM 会再分发上游官方二进制。安装或再分发前请自行确认该许可是否允许你的
+使用方式。
+
+---
+
+The packaging scripts, RPM spec, and GitHub Actions workflow in this
+repository are under the MIT License. See LICENSE.
+
+This is an unofficial packaging repository. It is not affiliated with,
+endorsed by, or maintained by Synthetify Labs or nightly-labs.
+
+OpenBot itself is copyright Synthetify Labs and is licensed under the
+PolyForm Noncommercial License 1.0.0:
+
+https://polyformproject.org/licenses/noncommercial/1.0.0/
+https://github.com/nightly-labs/openbot
+
+Commercial use of OpenBot requires a separate license from Synthetify Labs.
+RPMs built here redistribute the official upstream binary. Check that
+license before you install or redistribute them.
